@@ -1,6 +1,7 @@
 APP   := CmdTabMax
 SWIFT := swiftc
-FLAGS := -O -framework Cocoa -framework ApplicationServices
+FLAGS := -O -framework Cocoa -framework ApplicationServices \
+         -F/System/Library/PrivateFrameworks -framework SkyLight
 SRC   := $(APP).swift
 DIST  := dist
 
