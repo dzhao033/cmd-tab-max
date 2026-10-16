@@ -1,10 +1,7 @@
 # CmdTabMax
 <img src="https://img.shields.io/badge/stability-stable-green.svg?style=flat-square"> <img src="https://img.shields.io/github/v/release/stoutput/cmd-tab-max.svg?style=flat-square"> <img src="https://img.shields.io/github/languages/code-size/stoutput/cmd-tab-max.svg?color=%23307ABE&style=flat-square"> <img src="https://img.shields.io/github/downloads/stoutput/cmd-tab-max/total.svg?style=flat-square">
 
-
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Y8Y81X7LER)
-
-MacOS, annoyingly, does not restore windows when you Cmd-Tab to them. This fixes that.
+This is a fork of CmdTabMax that enables cmd tab to open browser windows with fullscreened content. This now works on keyboard only cmd tab usage as well as clicking on the icon when cmd tab is held down. 
 
 ## Install/Update
 
@@ -28,8 +25,6 @@ CmdTabMax installs a global keyboard event tap to detect Cmd-Tab releases, then 
 - if a non-minimized window already exists, does nothing (normal app activation brings it to the front);
 - if every window is minimized, unminimizes one;
 - if no windows exist at all, posts Cmd+N to the app to open a new one.
-
-No private frameworks.
 
 ## Build from source
 
