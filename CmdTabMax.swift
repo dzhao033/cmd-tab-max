@@ -11,11 +11,18 @@ private let skippedBundleIDs: Set<String> = [
 
 // MARK: - Accessibility permission check
 
+// Written by `make install` right after it resets the grant, so there is
+// nothing to wait for; consumed on startup so later logins still retry.
+private let freshInstallMarker = "/tmp/CmdTabMax.fresh-install"
+
 func requireAccessibility() {
+    let freshInstall = (try? FileManager.default.removeItem(atPath: freshInstallMarker)) != nil
+
     // Retry silently — TCC may not be ready immediately at login.
-    for _ in 0..<20 {
+    for attempt in 0..<20 {
         if AXIsProcessTrusted() { return }
-        Thread.sleep(forTimeInterval: 0.5)
+        if freshInstall || attempt == 19 { break }
+        waitServicingRunLoop(0.5)
     }
 
     // Show the System Settings prompt, then poll until the user grants.
@@ -25,9 +32,23 @@ func requireAccessibility() {
     let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
     AXIsProcessTrustedWithOptions(opts)
     while !AXIsProcessTrusted() {
-        Thread.sleep(forTimeInterval: 0.5)
+        waitServicingRunLoop(0.5)
     }
     print("Accessibility granted — continuing")
+}
+
+// AXIsProcessTrusted caches its answer until the process handles the system's
+// trust-change notification, which arrives via the main run loop. Sleeping
+// the thread would leave the cache stale forever, so spin the run loop instead.
+func waitServicingRunLoop(_ seconds: TimeInterval) {
+    let deadline = Date(timeIntervalSinceNow: seconds)
+    // A run loop with no sources returns immediately; the timer keeps it waiting.
+    let timer = Timer(fire: deadline, interval: 0, repeats: false) { _ in }
+    RunLoop.current.add(timer, forMode: .default)
+    while Date() < deadline {
+        RunLoop.current.run(mode: .default, before: deadline)
+    }
+    timer.invalidate()
 }
 
 // MARK: - Window handling
@@ -121,28 +142,45 @@ private func _AXUIElementGetWindow(_ element: AXUIElement, _ wid: inout CGWindow
 @_silgen_name("_AXUIElementCreateWithRemoteToken")
 private func _AXUIElementCreateWithRemoteToken(_ token: CFData) -> Unmanaged<AXUIElement>?
 
+// Element IDs are handed out sequentially over the app's lifetime (Chrome's
+// windows were past 3000 after a few days), so keep scanning until a long run
+// of IDs turns up no window rather than stopping at a fixed bound.
+private let remoteWindowScanGap: UInt64 = 5000
+private let remoteWindowScanLimit: UInt64 = 200_000
+
 // kAXWindowsAttribute omits windows in other Spaces, so probe the app's AX
-// element IDs directly for the one backing this window (as AltTab does).
-func axWindow(pid: pid_t, wid: CGWindowID) -> AXUIElement? {
+// element IDs directly (as AltTab does). `body` returns true to stop early.
+func forEachRemoteWindow(pid: pid_t, _ body: (AXUIElement, CGWindowID) -> Bool) {
     var token = Data(count: 20)
     token.replaceSubrange(0..<4, with: withUnsafeBytes(of: pid) { Data($0) })
     token.replaceSubrange(8..<12, with: withUnsafeBytes(of: UInt32(0x636f636f)) { Data($0) })
-    for elementID in UInt64(0)..<1000 {
+    var lastHit: UInt64 = 0
+    var elementID: UInt64 = 0
+    while elementID < remoteWindowScanLimit && elementID - lastHit < remoteWindowScanGap {
+        defer { elementID += 1 }
         token.replaceSubrange(12..<20, with: withUnsafeBytes(of: elementID) { Data($0) })
         guard let element = _AXUIElementCreateWithRemoteToken(token as CFData)?.takeRetainedValue() else { continue }
-        var elementWID: CGWindowID = 0
-        if _AXUIElementGetWindow(element, &elementWID) == .success && elementWID == wid {
-            return element
-        }
+        var wid: CGWindowID = 0
+        guard _AXUIElementGetWindow(element, &wid) == .success else { continue }
+        lastHit = elementID
+        if body(element, wid) { return }
     }
-    return nil
 }
 
-func focusWindow(_ wid: CGWindowID, of app: NSRunningApplication) {
+func axWindow(pid: pid_t, wid: CGWindowID) -> AXUIElement? {
+    var found: AXUIElement?
+    forEachRemoteWindow(pid: pid) { element, elementWID in
+        if elementWID == wid { found = element }
+        return found != nil
+    }
+    return found
+}
+
+func focusWindow(_ wid: CGWindowID, of app: NSRunningApplication, element: AXUIElement? = nil) {
     var psn = ProcessSerialNumber()
     guard GetProcessForPID(app.processIdentifier, &psn) == noErr else { return }
     _ = _SLPSSetFrontProcessWithOptions(&psn, wid, slpsUserGenerated)
-    if let window = axWindow(pid: app.processIdentifier, wid: wid) {
+    if let window = element ?? axWindow(pid: app.processIdentifier, wid: wid) {
         AXUIElementPerformAction(window, kAXRaiseAction as CFString)
     }
 }
@@ -174,18 +212,101 @@ func openNewWindow(for app: NSRunningApplication) {
     up.postToPid(app.processIdentifier)
 }
 
+// MARK: - Window cycling
+
+private let graveKeyCode: Int64 = 50
+
+// Cmd-` only cycles windows within the current Space, so it can neither reach
+// an app's fullscreen window nor leave it. Take over only when that matters.
+func appNeedingWindowCycling() -> NSRunningApplication? {
+    guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+    let pid = app.processIdentifier
+    return fullscreenSpaces().contains { $0.windows[pid] != nil } ? app : nil
+}
+
+func cycleWindows(of app: NSRunningApplication, backwards: Bool) {
+    let pid = app.processIdentifier
+    let spaces = fullscreenSpaces()
+
+    // Standard windows only: fullscreen Chrome also reports its toolbar and
+    // overlay panels as AXWindows, which aren't real cycle targets.
+    var elements: [CGWindowID: AXUIElement] = [:]
+    func consider(_ window: AXUIElement, _ wid: CGWindowID) {
+        var subroleRef: CFTypeRef?
+        var minRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(window, kAXSubroleAttribute as CFString, &subroleRef)
+        AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minRef)
+        if (subroleRef as? String) == kAXStandardWindowSubrole as String && (minRef as? Bool) != true {
+            elements[wid] = window
+        }
+    }
+
+    // From a regular Space kAXWindowsAttribute also lists the app's fullscreen
+    // windows, but from inside a fullscreen Space it lists only that Space's,
+    // so fall back to the slower scan to find the desktop windows.
+    var current = spaces.first(where: { $0.isCurrent })?.windows[pid]
+    if current != nil {
+        forEachRemoteWindow(pid: pid) { window, wid in consider(window, wid); return false }
+    } else {
+        let axApp = AXUIElementCreateApplication(pid)
+        var windowsRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+           let windows = windowsRef as? [AXUIElement] {
+            for window in windows {
+                var wid: CGWindowID = 0
+                if _AXUIElementGetWindow(window, &wid) == .success { consider(window, wid) }
+            }
+        }
+    }
+
+    // Sorted for a stable cycle; z-order would just flip between two windows.
+    let wids = Set(elements.keys).union(spaces.compactMap { $0.windows[pid] }).sorted()
+    guard wids.count > 1 else { return }
+
+    // AX's focused window can lag behind Space switches, so ask the window
+    // server which of the app's windows is frontmost on screen.
+    if current == nil,
+       let onScreen = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] {
+        current = onScreen.lazy
+            .filter { ($0[kCGWindowOwnerPID as String] as? pid_t) == pid }
+            .compactMap { ($0[kCGWindowNumber as String] as? Int).map(CGWindowID.init) }
+            .first { wids.contains($0) }
+    }
+
+    let next: CGWindowID
+    if let index = current.flatMap({ wids.firstIndex(of: $0) }) {
+        next = wids[(index + (backwards ? wids.count - 1 : 1)) % wids.count]
+    } else {
+        next = wids[0]
+    }
+    focusWindow(next, of: app, element: elements[next])
+}
+
 // MARK: - Event tap
 
 var cmdTabWasPressed = false
 var expectingSwitch = false
+var eventTap: CFMachPort?
 
 let eventCallback: CGEventTapCallBack = { _, type, event, _ in
     switch type {
     case .keyDown:
-        if event.getIntegerValueField(.keyboardEventKeycode) == tabKeyCode
-            && event.flags.contains(.maskCommand) {
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        if keyCode == tabKeyCode && event.flags.contains(.maskCommand) {
             cmdTabWasPressed = true
         }
+        if keyCode == graveKeyCode
+            && event.flags.contains(.maskCommand)
+            && event.flags.isDisjoint(with: [.maskControl, .maskAlternate]),
+           let app = appNeedingWindowCycling() {
+            let backwards = event.flags.contains(.maskShift)
+            DispatchQueue.main.async { cycleWindows(of: app, backwards: backwards) }
+            return nil
+        }
+    case .tapDisabledByTimeout, .tapDisabledByUserInput:
+        // The keyDown path now does real work; recover if macOS ever
+        // disables the tap for being slow instead of silently going dead.
+        if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
     case .flagsChanged:
         if !event.flags.contains(.maskCommand) && cmdTabWasPressed {
             cmdTabWasPressed = false
@@ -216,6 +337,9 @@ NSWorkspace.shared.notificationCenter.addObserver(
 ) { notification in
     guard expectingSwitch else { return }
     expectingSwitch = false
+    // A newer switch supersedes any check still waiting on a Space change;
+    // otherwise it fires on the next Space switch and targets the wrong app.
+    pendingApp = nil
     guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
             as? NSRunningApplication else { return }
 
@@ -238,7 +362,7 @@ NSWorkspace.shared.notificationCenter.addObserver(
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             guard pendingApp === app else { return }
             pendingApp = nil
-            ensureVisibleWindow(app: app)
+            ensureVisibleWindowIfFrontmost(app: app)
         }
         return
     }
@@ -253,6 +377,14 @@ NSWorkspace.shared.notificationCenter.addObserver(
 ) { _ in
     guard let app = pendingApp else { return }
     pendingApp = nil
+    ensureVisibleWindowIfFrontmost(app: app)
+}
+
+// Deferred checks can outlive the switch that scheduled them; if the user has
+// since moved on, the app's windows aren't in the current Space and would
+// look missing.
+func ensureVisibleWindowIfFrontmost(app: NSRunningApplication) {
+    guard NSWorkspace.shared.frontmostApplication == app else { return }
     ensureVisibleWindow(app: app)
 }
 
@@ -277,6 +409,7 @@ guard let tap = CGEvent.tapCreate(
     exit(1)
 }
 
+eventTap = tap
 let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
 CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
 CGEvent.tapEnable(tap: tap, enable: true)
