@@ -4,6 +4,16 @@ import ApplicationServices
 // Disable stdout buffering so log output reaches the file immediately.
 setbuf(stdout, nil)
 
+private let logTimestamp: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "HH:mm:ss.SSS"
+    return formatter
+}()
+
+func log(_ message: String) {
+    print("\(logTimestamp.string(from: Date())) \(message)")
+}
+
 private let tabKeyCode: Int64 = 48
 private let skippedBundleIDs: Set<String> = [
     "com.apple.systemuiserver",
@@ -28,13 +38,13 @@ func requireAccessibility() {
     // Show the System Settings prompt, then poll until the user grants.
     // Polling and continuing in-process avoids the TCC propagation race
     // that occurs when we exit and KeepAlive restarts us too quickly.
-    print("Accessibility not granted — opening System Settings")
+    log("Accessibility not granted — opening System Settings")
     let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
     AXIsProcessTrustedWithOptions(opts)
     while !AXIsProcessTrusted() {
         waitServicingRunLoop(0.5)
     }
-    print("Accessibility granted — continuing")
+    log("Accessibility granted — continuing")
 }
 
 // AXIsProcessTrusted caches its answer until the process handles the system's
@@ -176,10 +186,30 @@ func axWindow(pid: pid_t, wid: CGWindowID) -> AXUIElement? {
     return found
 }
 
+@_silgen_name("SLPSPostEventRecordTo")
+private func SLPSPostEventRecordTo(_ psn: inout ProcessSerialNumber, _ bytes: UnsafeMutablePointer<UInt8>) -> CGError
+
+// Fronting an inactive app's window shows it without making it the app's key
+// window, so the app keeps treating another window as focused (and reports
+// that one later). Post the window-server events that make it key, as AltTab
+// does.
+func makeKeyWindow(_ wid: CGWindowID, psn: inout ProcessSerialNumber) {
+    var bytes = [UInt8](repeating: 0, count: 0xf8)
+    bytes[0x04] = 0xf8
+    bytes[0x3a] = 0x10
+    withUnsafeBytes(of: wid) { bytes.replaceSubrange(0x3c..<0x40, with: $0) }
+    bytes.replaceSubrange(0x20..<0x30, with: repeatElement(0xff, count: 0x10))
+    bytes[0x08] = 0x01
+    _ = SLPSPostEventRecordTo(&psn, &bytes)
+    bytes[0x08] = 0x02
+    _ = SLPSPostEventRecordTo(&psn, &bytes)
+}
+
 func focusWindow(_ wid: CGWindowID, of app: NSRunningApplication, element: AXUIElement? = nil) {
     var psn = ProcessSerialNumber()
     guard GetProcessForPID(app.processIdentifier, &psn) == noErr else { return }
     _ = _SLPSSetFrontProcessWithOptions(&psn, wid, slpsUserGenerated)
+    makeKeyWindow(wid, psn: &psn)
     if let window = element ?? axWindow(pid: app.processIdentifier, wid: wid) {
         AXUIElementPerformAction(window, kAXRaiseAction as CFString)
     }
@@ -282,18 +312,180 @@ func cycleWindows(of app: NSRunningApplication, backwards: Bool) {
     focusWindow(next, of: app, element: elements[next])
 }
 
+// MARK: - Switcher selection
+
+// While Cmd-Tab is held, the Dock exposes the switcher as an
+// AXProcessSwitcherList whose selected child is the highlighted app.
+func switcherList() -> AXUIElement? {
+    guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { return nil }
+    let axDock = AXUIElementCreateApplication(dock.processIdentifier)
+    // Called from the event tap; don't let a busy Dock stall input.
+    AXUIElementSetMessagingTimeout(axDock, 0.1)
+
+    var childrenRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(axDock, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+          let children = childrenRef as? [AXUIElement] else { return nil }
+    return children.first { child in
+        var subroleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(child, kAXSubroleAttribute as CFString, &subroleRef)
+        return (subroleRef as? String) == "AXProcessSwitcherList"
+    }
+}
+
+// The item carries only the app's name, so give up when that's ambiguous.
+func selectedApp(in switcher: AXUIElement) -> NSRunningApplication? {
+    var selectedRef: CFTypeRef?
+    var titleRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(switcher, kAXSelectedChildrenAttribute as CFString, &selectedRef) == .success,
+          let selected = (selectedRef as? [AXUIElement])?.first,
+          AXUIElementCopyAttributeValue(selected, kAXTitleAttribute as CFString, &titleRef) == .success,
+          let title = titleRef as? String else { return nil }
+    let matches = NSWorkspace.shared.runningApplications.filter {
+        $0.activationPolicy == .regular && $0.localizedName == title
+    }
+    return matches.count == 1 ? matches[0] : nil
+}
+
+// Regular apps, most recently activated first: the order the switcher uses.
+var activationHistory: [pid_t] = []
+
+// The app the in-progress Cmd-Tab will land on, if it can be determined.
+func switchTarget() -> NSRunningApplication? {
+    if let switcher = switcherList() {
+        return selectedApp(in: switcher)
+    }
+    // A quick tap completes before the switcher is ever drawn, leaving
+    // nothing to read; a single forward Tab always means the previous app.
+    guard tabPresses == 1, !tabUsedShift else { return nil }
+    return previousApp()
+}
+
+// Where a single forward Tab lands: the app used before the frontmost one.
+func previousApp() -> NSRunningApplication? {
+    guard activationHistory.count >= 2,
+          activationHistory[0] == NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
+    return NSRunningApplication(processIdentifier: activationHistory[1])
+}
+
+// The fullscreen window to bring up when switching to `app`, if any: the one
+// the user last left the app from, or any if the app has nothing visible here
+// (a fullscreen window looks like no window at all to AX).
+func fullscreenTarget(for app: NSRunningApplication, spaces: [FullscreenSpace]) -> CGWindowID? {
+    let pid = app.processIdentifier
+    let elsewhere = spaces.filter { !$0.isCurrent }.compactMap { $0.windows[pid] }
+    guard !elsewhere.isEmpty else { return nil }
+    if let last = lastFocusedWindow[pid], elsewhere.contains(last) { return last }
+    if spaces.contains(where: { $0.isCurrent && $0.windows[pid] != nil }) || hasVisibleWindow(app: app) {
+        return nil
+    }
+    return elsewhere.first
+}
+
+private let escapeKeyCode: CGKeyCode = 0x35
+
+// Cmd-Esc dismisses the switcher without activating anything.
+func cancelSwitcher() {
+    let src = CGEventSource(stateID: .hidSystemState)
+    guard let down = CGEvent(keyboardEventSource: src, virtualKey: escapeKeyCode, keyDown: true),
+          let up = CGEvent(keyboardEventSource: src, virtualKey: escapeKeyCode, keyDown: false) else { return }
+    down.flags = .maskCommand
+    up.flags = .maskCommand
+    down.post(tap: .cgSessionEventTap)
+    up.post(tap: .cgSessionEventTap)
+}
+
+// If the switch should land on a fullscreen window, cancel the switcher and
+// go there ourselves. Letting the Dock finish the switch activates the app in
+// the current Space, flashing (and keeping focus on) a window here instead.
+// The caller must swallow the event that would have completed the switch.
+func takeOverSwitch() -> Bool {
+    guard let app = switchTarget(),
+          app != NSWorkspace.shared.frontmostApplication,
+          let target = fullscreenTarget(for: app, spaces: fullscreenSpaces()) else { return false }
+    log("Switching straight to fullscreen window of \(app.localizedName ?? "?")")
+    cancelSwitcher()
+    DispatchQueue.main.async { focusWindow(target, of: app) }
+    return true
+}
+
+// MARK: - Quick Cmd-Tab
+
+// Before the switcher is drawn the Dock ignores the Cmd-Esc cancel, so a
+// quick tap would still activate the app in the current Space and flash a
+// window there. When a quick tap would land on a fullscreen window, hold the
+// Tab back from the Dock entirely and do the switch ourselves on release.
+struct DeferredTab {
+    let event: CGEvent
+    let app: NSRunningApplication
+    let window: CGWindowID
+}
+
+var deferredTab: DeferredTab?
+
+// Longer than a quick tap; past it the user wants the switcher, so the Dock
+// gets the Tab after all (delaying the switcher's appearance by this much).
+private let quickTapWindow: TimeInterval = 0.2
+
+// Marks events we re-post so the tap passes them through untouched.
+private let repostedEventMarker: Int64 = 0x43544D58
+
+func repost(_ event: CGEvent) {
+    guard let copy = event.copy() else { return }
+    copy.setIntegerValueField(.eventSourceUserData, value: repostedEventMarker)
+    copy.post(tap: .cgSessionEventTap)
+}
+
+func releaseDeferredTab() {
+    guard let deferred = deferredTab else { return }
+    deferredTab = nil
+    repost(deferred.event)
+}
+
+func deferTabIfQuickSwitchNeedsIt(_ event: CGEvent) -> Bool {
+    guard let app = previousApp(),
+          let window = fullscreenTarget(for: app, spaces: fullscreenSpaces()) else { return false }
+    let deferred = DeferredTab(event: event, app: app, window: window)
+    deferredTab = deferred
+    DispatchQueue.main.asyncAfter(deadline: .now() + quickTapWindow) {
+        if deferredTab?.event === deferred.event { releaseDeferredTab() }
+    }
+    return true
+}
+
 // MARK: - Event tap
 
 var cmdTabWasPressed = false
+var tabPresses = 0
+var tabUsedShift = false
 var expectingSwitch = false
 var eventTap: CFMachPort?
 
 let eventCallback: CGEventTapCallBack = { _, type, event, _ in
+    if event.getIntegerValueField(.eventSourceUserData) == repostedEventMarker {
+        return Unmanaged.passRetained(event)
+    }
     switch type {
     case .keyDown:
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-        if keyCode == tabKeyCode && event.flags.contains(.maskCommand) {
+        let isCmdTab = keyCode == tabKeyCode && event.flags.contains(.maskCommand)
+        if isCmdTab {
+            if !cmdTabWasPressed {
+                tabPresses = 0
+                tabUsedShift = false
+            }
             cmdTabWasPressed = true
+            tabPresses += 1
+            tabUsedShift = tabUsedShift || event.flags.contains(.maskShift)
+        }
+        if deferredTab != nil {
+            // More than a quick tap: hand the Dock the Tab it missed, then
+            // this key, in order.
+            releaseDeferredTab()
+            repost(event)
+            return nil
+        }
+        if isCmdTab && tabPresses == 1 && !tabUsedShift && deferTabIfQuickSwitchNeedsIt(event) {
+            return nil
         }
         if keyCode == graveKeyCode
             && event.flags.contains(.maskCommand)
@@ -306,11 +498,27 @@ let eventCallback: CGEventTapCallBack = { _, type, event, _ in
     case .tapDisabledByTimeout, .tapDisabledByUserInput:
         // The keyDown path now does real work; recover if macOS ever
         // disables the tap for being slow instead of silently going dead.
+        log("Event tap disabled (\(type.rawValue)), re-enabling")
         if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
     case .flagsChanged:
         if !event.flags.contains(.maskCommand) && cmdTabWasPressed {
             cmdTabWasPressed = false
+            if let deferred = deferredTab {
+                // The Dock never saw this switch; make it ourselves.
+                deferredTab = nil
+                log("Quick-switching to fullscreen window of \(deferred.app.localizedName ?? "?")")
+                DispatchQueue.main.async { focusWindow(deferred.window, of: deferred.app) }
+                break
+            }
+            // Still armed after a takeover, in case the cancel didn't land
+            // and the Dock activated the app anyway.
             expectingSwitch = true
+            if takeOverSwitch() {
+                // Deliver the Cmd release after the queued Cmd-Esc, so the
+                // switcher sees the cancel while Cmd is still down.
+                event.copy()?.post(tap: .cgSessionEventTap)
+                return nil
+            }
         }
     case .leftMouseDown:
         // Clicking an icon in the switcher activates the app while Cmd is
@@ -318,6 +526,7 @@ let eventCallback: CGEventTapCallBack = { _, type, event, _ in
         if cmdTabWasPressed {
             cmdTabWasPressed = false
             expectingSwitch = true
+            if takeOverSwitch() { return nil }
         }
     default:
         break
@@ -330,27 +539,71 @@ let eventCallback: CGEventTapCallBack = { _, type, event, _ in
 // App awaiting a window check until the Space switch completes.
 var pendingApp: NSRunningApplication?
 
+// Each app's focused window as of when it last lost focus. By the time the
+// activation notification arrives, macOS has already re-keyed a window in the
+// current Space, so the app's own answer then no longer says where the user was.
+var lastFocusedWindow: [pid_t: CGWindowID] = [:]
+
+NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.didDeactivateApplicationNotification,
+    object: nil,
+    queue: .main
+) { notification in
+    guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+            as? NSRunningApplication else { return }
+    let pid = app.processIdentifier
+    var focusedRef: CFTypeRef?
+    var wid: CGWindowID = 0
+    // Leaving from the app's fullscreen Space is unambiguous, and the window
+    // server knows it even when the app's idea of its key window is stale.
+    if let fullscreenWID = fullscreenSpaces().first(where: { $0.isCurrent })?.windows[pid] {
+        lastFocusedWindow[pid] = fullscreenWID
+    } else if AXUIElementCopyAttributeValue(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
+       let focusedRef,
+       _AXUIElementGetWindow(focusedRef as! AXUIElement, &wid) == .success {
+        lastFocusedWindow[pid] = wid
+    } else {
+        lastFocusedWindow[pid] = nil
+    }
+}
+
+NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.didTerminateApplicationNotification,
+    object: nil,
+    queue: .main
+) { notification in
+    guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+            as? NSRunningApplication else { return }
+    lastFocusedWindow[app.processIdentifier] = nil
+    activationHistory.removeAll { $0 == app.processIdentifier }
+}
+
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.didActivateApplicationNotification,
     object: nil,
     queue: .main
 ) { notification in
+    guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+            as? NSRunningApplication else { return }
+    if app.activationPolicy == .regular {
+        activationHistory.removeAll { $0 == app.processIdentifier }
+        activationHistory.insert(app.processIdentifier, at: 0)
+    }
+
     guard expectingSwitch else { return }
     expectingSwitch = false
     // A newer switch supersedes any check still waiting on a Space change;
     // otherwise it fires on the next Space switch and targets the wrong app.
     pendingApp = nil
-    guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
-            as? NSRunningApplication else { return }
 
-    // AX only lists windows in the current Space, so a fullscreen window
-    // looks like no window at all. If the app has nothing visible here,
-    // jump to its fullscreen window instead of unminimizing or opening one.
+    // Fallback for when the switcher selection couldn't be read: activation
+    // alone keeps the user in the current Space, so jump afterwards instead
+    // of unminimizing or opening a window.
     let spaces = fullscreenSpaces()
-    if let space = spaces.first(where: { $0.windows[app.processIdentifier] != nil }) {
-        if !space.isCurrent && !hasVisibleWindow(app: app) {
-            print("Switching to fullscreen window of \(app.localizedName ?? "?")")
-            focusWindow(space.windows[app.processIdentifier]!, of: app)
+    if spaces.contains(where: { $0.windows[app.processIdentifier] != nil }) {
+        if let target = fullscreenTarget(for: app, spaces: spaces) {
+            log("Switching to fullscreen window of \(app.localizedName ?? "?")")
+            focusWindow(target, of: app)
         }
         return
     }
@@ -405,7 +658,7 @@ guard let tap = CGEvent.tapCreate(
     callback: eventCallback,
     userInfo: nil
 ) else {
-    print("❌ Could not create event tap. Make sure Accessibility is granted.")
+    log("❌ Could not create event tap. Make sure Accessibility is granted.")
     exit(1)
 }
 
@@ -414,6 +667,6 @@ let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
 CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
 CGEvent.tapEnable(tap: tap, enable: true)
 
-print("Event tap created, run loop starting")
+log("Event tap created, run loop starting")
 
 RunLoop.main.run()
